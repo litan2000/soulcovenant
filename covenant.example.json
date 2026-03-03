@@ -1,0 +1,7 @@
+{
+  "api_key": "your-api-key-here",
+  "base_url": "https://api.aicodewith.com",
+  "model": "claude-opus-4-6-20260205",
+  "max_tokens": 16384,
+  "models": {}
+}

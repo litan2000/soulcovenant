@@ -1,0 +1,1001 @@
+#!/usr/bin/env python3
+"""SoulCovenant — lightweight multi-model CLI, direct API streaming."""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import anthropic
+import openai
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+
+# ─── Paths ────────────────────────────────────────────────────────────────────
+
+HOME = Path.home()
+COVENANT_DIR = HOME / ".soulcovenant"
+COVENANT_CFG = COVENANT_DIR / "covenant.json"
+GENESIS_FILE = COVENANT_DIR / "genesis.md"
+SOUL_DIR = COVENANT_DIR / "soul"
+SCROLLS_DIR = COVENANT_DIR / "scrolls"
+
+for d in (COVENANT_DIR, SOUL_DIR, SCROLLS_DIR, COVENANT_DIR / "relics"):
+    d.mkdir(parents=True, exist_ok=True)
+
+console = Console()
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+DEFAULT_MODEL = "claude-opus-4-6-20260205"
+MAX_TOKENS = 16384
+
+# Provider registry: model prefix → (provider_type, base_url)
+PROVIDERS = {
+    "claude": {
+        "type": "anthropic",
+        "base_url": "https://api.aicodewith.com",
+    },
+    "gpt": {
+        "type": "openai",
+        "base_url": "https://api.aicodewith.com/chatgpt/v1",
+    },
+    "gemini": {
+        "type": "openai",  # gemini via openai-compatible endpoint
+        "base_url": "https://api.aicodewith.com/gemini_cli/v1beta",
+    },
+}
+
+# Model aliases for quick switching
+MODEL_ALIASES = {
+    "opus": "claude-opus-4-6-20260205",
+    "opus4.6": "claude-opus-4-6-20260205",
+    "sonnet": "claude-sonnet-4-6",
+    "sonnet4.6": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5-20251001",
+    "haiku4.5": "claude-haiku-4-5-20251001",
+    "codex": "gpt-5.3-codex",
+    "gpt5.3": "gpt-5.3-codex",
+    "gpt5.2": "gpt-5.2",
+    "gemini": "gemini-3-pro",
+    "gemini3": "gemini-3-pro",
+}
+
+
+def resolve_model(name):
+    """Resolve model alias or return as-is."""
+    return MODEL_ALIASES.get(name.lower(), name)
+
+
+def get_provider(model):
+    """Determine provider config for a model ID."""
+    for prefix, cfg in PROVIDERS.items():
+        if model.startswith(prefix):
+            return cfg
+    # Default to anthropic
+    return PROVIDERS["claude"]
+
+
+def load_config():
+    """Load config: env vars > covenant.json > defaults."""
+    cfg = {"model": DEFAULT_MODEL, "max_tokens": MAX_TOKENS}
+    if COVENANT_CFG.exists():
+        try:
+            with open(COVENANT_CFG) as f:
+                file_cfg = json.load(f)
+            cfg.update(file_cfg)
+        except Exception:
+            pass
+
+    # Env overrides
+    if os.environ.get("ANTHROPIC_AUTH_TOKEN"):
+        cfg["api_key"] = os.environ["ANTHROPIC_AUTH_TOKEN"]
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        cfg["api_key"] = os.environ["ANTHROPIC_API_KEY"]
+    if os.environ.get("ANTHROPIC_BASE_URL"):
+        cfg["base_url"] = os.environ["ANTHROPIC_BASE_URL"]
+    return cfg
+
+
+REGISTRY_URL = "https://raw.githubusercontent.com/DaneelOlivaw1/openclaw-aicodewith-auth/main/src/models/registry.ts"
+
+
+def sync_models():
+    """Fetch latest model list from aicodewith plugin repo and update covenant.json."""
+    import re
+    import urllib.request
+
+    console.print("[cyan]Syncing models from aicodewith plugin repo...[/cyan]")
+    try:
+        req = urllib.request.Request(REGISTRY_URL, headers={"User-Agent": "SoulCovenant"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            src = resp.read().decode()
+    except Exception as e:
+        console.print(f"[red]Failed to fetch registry: {e}[/red]")
+        return False
+
+    # Parse model blocks — each block is "  { ... }" in the MODELS array
+    new_models = {}
+    for block in re.findall(r'  \{(.*?)\n  \}', src, re.DOTALL):
+        if "deprecated: true" in block:
+            continue
+        m_id = re.search(r'id:\s*"([^"]+)"', block)
+        m_name = re.search(r'(?<!\w)name:\s*"([^"]+)"', block)
+        m_family = re.search(r'family:\s*"([^"]+)"', block)
+        m_ctx = re.search(r'contextWindow:\s*(\d+)', block)
+        m_max = re.search(r'maxTokens:\s*(\d+)', block)
+        if not all([m_id, m_name, m_family, m_ctx, m_max]):
+            continue
+        new_models[m_id.group(1)] = {
+            "name": m_name.group(1),
+            "family": m_family.group(1),
+            "context_window": int(m_ctx.group(1)),
+            "max_tokens": int(m_max.group(1)),
+        }
+
+    if not new_models:
+        console.print("[red]No models found in registry.[/red]")
+        return False
+
+    # Load existing covenant.json, update models only
+    cfg = {}
+    if COVENANT_CFG.exists():
+        try:
+            with open(COVENANT_CFG) as f:
+                cfg = json.load(f)
+        except Exception:
+            pass
+
+    old_models = cfg.get("models", {})
+    cfg["models"] = new_models
+
+    with open(COVENANT_CFG, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+    # Diff
+    old_ids = set(old_models.keys())
+    new_ids = set(new_models.keys())
+    added = new_ids - old_ids
+    removed = old_ids - new_ids
+
+    console.print(f"[green]✓ Synced {len(new_models)} active models[/green]")
+    for mid, info in sorted(new_models.items()):
+        tag = " [green](new!)[/green]" if mid in added else ""
+        console.print(f"  [dim]{mid}[/dim] — {info['name']} [{info['family']}]{tag}")
+    for mid in sorted(removed):
+        console.print(f"  [dim]{mid}[/dim] — [red](removed)[/red]")
+
+    return True
+
+
+# ─── Memory (Soul) ───────────────────────────────────────────────────────────
+
+def load_soul():
+    """Read all .md files from soul/ directory."""
+    parts = []
+    for md in sorted(SOUL_DIR.glob("*.md")):
+        try:
+            content = md.read_text().strip()
+            if content:
+                parts.append(f"## {md.stem}\n\n{content}")
+        except Exception:
+            pass
+    return "\n\n---\n\n".join(parts)
+
+
+def build_system_prompt():
+    """Build system prompt from genesis.md + soul memories."""
+    sections = []
+
+    if GENESIS_FILE.exists():
+        try:
+            genesis = GENESIS_FILE.read_text().strip()
+            if genesis:
+                sections.append(genesis)
+        except Exception:
+            pass
+
+    soul = load_soul()
+    if soul:
+        sections.append(f"# Soul Memories\n\n{soul}")
+
+    if not sections:
+        sections.append(
+            "You are a powerful AI coding assistant. "
+            "You have access to tools for running bash commands, reading files, writing files, and editing files. "
+            "Use them proactively to help the user. Be concise and direct."
+        )
+
+    return "\n\n---\n\n".join(sections)
+
+
+# ─── Tools ────────────────────────────────────────────────────────────────────
+
+# Anthropic format
+TOOL_DEFINITIONS_ANTHROPIC = [
+    {
+        "name": "bash",
+        "description": "Execute a shell command and return stdout/stderr. Use for running programs, git, installs, etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The bash command to execute"}
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "read_file",
+        "description": "Read the contents of a file at the given path.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Absolute or relative file path to read"}
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "write_file",
+        "description": "Write content to a file, creating it if needed. Overwrites existing content.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to write to"},
+                "content": {"type": "string", "description": "Content to write"},
+            },
+            "required": ["path", "content"],
+        },
+    },
+    {
+        "name": "edit_file",
+        "description": "Edit a file by replacing old_string with new_string. The old_string must match exactly.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to edit"},
+                "old_string": {"type": "string", "description": "Exact string to find and replace"},
+                "new_string": {"type": "string", "description": "Replacement string"},
+            },
+            "required": ["path", "old_string", "new_string"],
+        },
+    },
+]
+
+# OpenAI format
+TOOL_DEFINITIONS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Execute a shell command and return stdout/stderr. Use for running programs, git, installs, etc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The bash command to execute"}
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file at the given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative file path to read"}
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, creating it if needed. Overwrites existing content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write to"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Edit a file by replacing old_string with new_string. The old_string must match exactly.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "old_string": {"type": "string", "description": "Exact string to find and replace"},
+                    "new_string": {"type": "string", "description": "Replacement string"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+]
+
+
+def execute_tool(name, input_data):
+    """Execute a tool and return (success: bool, result: str)."""
+    try:
+        if name == "bash":
+            return _tool_bash(input_data["command"])
+        elif name == "read_file":
+            return _tool_read_file(input_data["path"])
+        elif name == "write_file":
+            return _tool_write_file(input_data["path"], input_data["content"])
+        elif name == "edit_file":
+            return _tool_edit_file(
+                input_data["path"], input_data["old_string"], input_data["new_string"]
+            )
+        else:
+            return False, f"Unknown tool: {name}"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
+def _tool_bash(command):
+    try:
+        result = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=120,
+        )
+        output = ""
+        if result.stdout:
+            output += result.stdout
+        if result.stderr:
+            if output:
+                output += "\n"
+            output += result.stderr
+        if not output:
+            output = "(no output)"
+        if result.returncode != 0:
+            output += f"\n[exit code: {result.returncode}]"
+        return result.returncode == 0, output
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out after 120 seconds"
+
+
+def _tool_read_file(path):
+    p = Path(path).expanduser()
+    if not p.exists():
+        return False, f"File not found: {path}"
+    try:
+        return True, p.read_text()
+    except Exception as e:
+        return False, f"Error reading file: {e}"
+
+
+def _tool_write_file(path, content):
+    p = Path(path).expanduser()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+        return True, f"Wrote {len(content)} bytes to {path}"
+    except Exception as e:
+        return False, f"Error writing file: {e}"
+
+
+def _tool_edit_file(path, old_string, new_string):
+    p = Path(path).expanduser()
+    if not p.exists():
+        return False, f"File not found: {path}"
+    try:
+        content = p.read_text()
+        count = content.count(old_string)
+        if count == 0:
+            return False, "old_string not found in file"
+        if count > 1:
+            return False, f"old_string found {count} times — must be unique. Provide more context."
+        new_content = content.replace(old_string, new_string, 1)
+        p.write_text(new_content)
+        return True, f"Edited {path} (replaced 1 occurrence)"
+    except Exception as e:
+        return False, f"Error editing file: {e}"
+
+
+def display_tool_call(name, inp):
+    """Show tool invocation in terminal."""
+    if name == "bash":
+        cmd_display = inp.get("command", "")
+        if len(cmd_display) > 80:
+            cmd_display = cmd_display[:77] + "..."
+        console.print(f"[yellow]⚒ bash:[/yellow] {cmd_display}")
+    elif name == "read_file":
+        console.print(f"[yellow]⚒ read_file:[/yellow] {inp.get('path', '')}")
+    elif name == "write_file":
+        console.print(f"[yellow]⚒ write_file:[/yellow] {inp.get('path', '')}")
+    elif name == "edit_file":
+        console.print(f"[yellow]⚒ edit_file:[/yellow] {inp.get('path', '')}")
+
+
+def display_tool_result(name, success, result):
+    """Show tool result in terminal."""
+    status = "[green]✓[/green]" if success else "[red]✗[/red]"
+    if name == "bash":
+        lines = result.strip().split("\n")
+        if len(lines) <= 5:
+            for line in lines:
+                console.print(f"  {status} {line}")
+        else:
+            for line in lines[:3]:
+                console.print(f"  {status} {line}")
+            console.print(f"  [dim]... ({len(lines) - 3} more lines)[/dim]")
+    else:
+        preview = result[:100] + ("..." if len(result) > 100 else "")
+        console.print(f"  {status} {preview}")
+
+
+# ─── Session (Scrolls) ───────────────────────────────────────────────────────
+
+class Scroll:
+    """JSONL session persistence."""
+
+    def __init__(self, path=None):
+        if path:
+            self.path = Path(path)
+        else:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            self.path = SCROLLS_DIR / f"{ts}.jsonl"
+        self.messages = []
+        if self.path.exists():
+            self._load()
+
+    def _load(self):
+        self.messages = []
+        try:
+            with open(self.path) as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        self.messages.append(json.loads(line))
+        except Exception as e:
+            console.print(f"[yellow]Warning: could not load scroll: {e}[/yellow]")
+
+    def append(self, message):
+        self.messages.append(message)
+        with open(self.path, "a") as f:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def latest():
+        scrolls = sorted(SCROLLS_DIR.glob("*.jsonl"))
+        return scrolls[-1] if scrolls else None
+
+
+# ─── Anthropic Streaming Backend ──────────────────────────────────────────────
+
+def stream_anthropic(client, model, max_tokens, system_prompt, messages, interrupted_fn):
+    """Stream via anthropic SDK. Returns (text, tool_uses, input_tokens, output_tokens)."""
+    tool_uses = []
+    input_tokens = 0
+    output_tokens = 0
+    stop_reason = None
+
+    with client.messages.stream(
+        model=model,
+        max_tokens=max_tokens,
+        system=system_prompt,
+        messages=messages,
+        tools=TOOL_DEFINITIONS_ANTHROPIC,
+    ) as stream:
+        current_text = ""
+        live = Live(Markdown(""), console=console, refresh_per_second=8, vertical_overflow="visible")
+        live.start()
+        try:
+            for event in stream:
+                if interrupted_fn():
+                    break
+
+                if event.type == "content_block_start":
+                    if event.content_block.type == "tool_use":
+                        tool_uses.append({
+                            "id": event.content_block.id,
+                            "name": event.content_block.name,
+                            "input": {},
+                            "_input_json": "",
+                        })
+
+                elif event.type == "content_block_delta":
+                    if event.delta.type == "text_delta":
+                        current_text += event.delta.text
+                        live.update(Markdown(current_text))
+                    elif event.delta.type == "input_json_delta":
+                        if tool_uses:
+                            tool_uses[-1]["_input_json"] += event.delta.partial_json
+
+                elif event.type == "message_delta":
+                    stop_reason = event.delta.stop_reason
+                    if hasattr(event, "usage") and event.usage:
+                        output_tokens = getattr(event.usage, "output_tokens", 0)
+
+                elif event.type == "message_start":
+                    if hasattr(event.message, "usage") and event.message.usage:
+                        input_tokens = event.message.usage.input_tokens
+        finally:
+            live.stop()
+
+    # Parse tool input JSON
+    for tu in tool_uses:
+        raw = tu.pop("_input_json", "")
+        if raw:
+            try:
+                tu["input"] = json.loads(raw)
+            except json.JSONDecodeError:
+                tu["input"] = {}
+
+    has_tool_calls = stop_reason == "tool_use" and len(tool_uses) > 0
+    return current_text, tool_uses, input_tokens, output_tokens, has_tool_calls
+
+
+def build_anthropic_assistant_msg(text, tool_uses):
+    """Build anthropic-format assistant message."""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for tu in tool_uses:
+        content.append({"type": "tool_use", "id": tu["id"], "name": tu["name"], "input": tu["input"]})
+    return {"role": "assistant", "content": content}
+
+
+def build_anthropic_tool_results(results):
+    """Build anthropic-format tool results message."""
+    return {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": r["id"], "content": r["output"], "is_error": r["is_error"]}
+        for r in results
+    ]}
+
+
+# ─── OpenAI Streaming Backend ────────────────────────────────────────────────
+
+def stream_openai(client, model, max_tokens, system_prompt, messages, interrupted_fn):
+    """Stream via openai SDK. Returns (text, tool_uses, input_tokens, output_tokens, has_tool_calls)."""
+    # Convert anthropic-format messages to openai format
+    oai_messages = _to_openai_messages(system_prompt, messages)
+
+    tool_uses = []
+    input_tokens = 0
+    output_tokens = 0
+
+    response = client.chat.completions.create(
+        model=model,
+        max_tokens=max_tokens,
+        messages=oai_messages,
+        tools=TOOL_DEFINITIONS_OPENAI,
+        stream=True,
+    )
+
+    current_text = ""
+    # Track tool calls by index
+    tc_map = {}  # index → {id, name, arguments_parts}
+
+    live = Live(Markdown(""), console=console, refresh_per_second=8, vertical_overflow="visible")
+    live.start()
+    try:
+        for chunk in response:
+            if interrupted_fn():
+                break
+
+            if hasattr(chunk, "usage") and chunk.usage:
+                input_tokens = getattr(chunk.usage, "prompt_tokens", 0)
+                output_tokens = getattr(chunk.usage, "completion_tokens", 0)
+
+            if not chunk.choices:
+                continue
+
+            delta = chunk.choices[0].delta
+
+            # Text content
+            if delta and delta.content:
+                current_text += delta.content
+                live.update(Markdown(current_text))
+
+            # Tool calls
+            if delta and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tc_map:
+                        tc_map[idx] = {"id": tc.id or "", "name": "", "arguments": ""}
+                    if tc.id:
+                        tc_map[idx]["id"] = tc.id
+                    if tc.function:
+                        if tc.function.name:
+                            tc_map[idx]["name"] = tc.function.name
+                        if tc.function.arguments:
+                            tc_map[idx]["arguments"] += tc.function.arguments
+    finally:
+        live.stop()
+
+    # Parse tool calls
+    for idx in sorted(tc_map.keys()):
+        tc = tc_map[idx]
+        try:
+            inp = json.loads(tc["arguments"]) if tc["arguments"] else {}
+        except json.JSONDecodeError:
+            inp = {}
+        tool_uses.append({"id": tc["id"], "name": tc["name"], "input": inp})
+
+    has_tool_calls = len(tool_uses) > 0
+    return current_text, tool_uses, input_tokens, output_tokens, has_tool_calls
+
+
+def _to_openai_messages(system_prompt, messages):
+    """Convert anthropic-format messages to openai chat format."""
+    oai = [{"role": "system", "content": system_prompt}]
+
+    for msg in messages:
+        role = msg["role"]
+        content = msg["content"]
+
+        if role == "user":
+            if isinstance(content, str):
+                oai.append({"role": "user", "content": content})
+            elif isinstance(content, list):
+                # Could be tool_results or mixed content
+                tool_results = [c for c in content if c.get("type") == "tool_result"]
+                if tool_results:
+                    for tr in tool_results:
+                        oai.append({
+                            "role": "tool",
+                            "tool_call_id": tr.get("tool_use_id", ""),
+                            "content": tr.get("content", ""),
+                        })
+                else:
+                    # Extract text
+                    texts = [c.get("text", "") for c in content if c.get("type") == "text"]
+                    oai.append({"role": "user", "content": "\n".join(texts)})
+
+        elif role == "assistant":
+            if isinstance(content, str):
+                oai.append({"role": "assistant", "content": content})
+            elif isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for c in content:
+                    if c.get("type") == "text":
+                        text_parts.append(c["text"])
+                    elif c.get("type") == "tool_use":
+                        tool_calls.append({
+                            "id": c["id"],
+                            "type": "function",
+                            "function": {
+                                "name": c["name"],
+                                "arguments": json.dumps(c["input"]),
+                            },
+                        })
+                msg_dict = {"role": "assistant"}
+                if text_parts:
+                    msg_dict["content"] = "\n".join(text_parts)
+                else:
+                    msg_dict["content"] = None
+                if tool_calls:
+                    msg_dict["tool_calls"] = tool_calls
+                oai.append(msg_dict)
+
+    return oai
+
+
+def build_openai_assistant_msg(text, tool_uses):
+    """Build anthropic-format assistant message (internal canonical format) from openai response."""
+    content = []
+    if text:
+        content.append({"type": "text", "text": text})
+    for tu in tool_uses:
+        content.append({"type": "tool_use", "id": tu["id"], "name": tu["name"], "input": tu["input"]})
+    return {"role": "assistant", "content": content}
+
+
+# ─── Chat Engine ──────────────────────────────────────────────────────────────
+
+class SoulCovenant:
+    def __init__(self, cfg, scroll=None):
+        self.cfg = cfg
+        self.model = cfg.get("model", DEFAULT_MODEL)
+        self.max_tokens = cfg.get("max_tokens", MAX_TOKENS)
+        self.api_key = cfg.get("api_key", "")
+        self.scroll = scroll or Scroll()
+        self.messages = list(self.scroll.messages)
+        self.system_prompt = build_system_prompt()
+        self._interrupted = False
+
+        # Pre-build clients
+        self._anthropic_clients = {}
+        self._openai_clients = {}
+
+    def _get_anthropic_client(self, base_url):
+        if base_url not in self._anthropic_clients:
+            kwargs = {}
+            if self.api_key:
+                kwargs["api_key"] = self.api_key
+            if base_url:
+                kwargs["base_url"] = base_url
+            self._anthropic_clients[base_url] = anthropic.Anthropic(**kwargs)
+        return self._anthropic_clients[base_url]
+
+    def _get_openai_client(self, base_url):
+        if base_url not in self._openai_clients:
+            self._openai_clients[base_url] = openai.OpenAI(
+                api_key=self.api_key or "dummy",
+                base_url=base_url,
+            )
+        return self._openai_clients[base_url]
+
+    def set_model(self, model):
+        model = resolve_model(model)
+        self.model = model
+        provider = get_provider(model)
+        models_catalog = self.cfg.get("models", {})
+        if model in models_catalog:
+            cat = models_catalog[model]
+            self.max_tokens = cat.get("max_tokens", MAX_TOKENS)
+            console.print(f"[cyan]Model → {cat.get('name', model)} ({model})[/cyan]")
+            console.print(f"[dim]  provider: {provider['type']} / context: {cat.get('context_window', '?')} / max_tokens: {self.max_tokens}[/dim]")
+        else:
+            console.print(f"[cyan]Model → {model}[/cyan]")
+            console.print(f"[dim]  provider: {provider['type']}[/dim]")
+
+    def stream_response(self):
+        """Send messages to API and stream back. Handles tool loop."""
+        while True:
+            self._interrupted = False
+            provider = get_provider(self.model)
+            provider_type = provider["type"]
+            base_url = provider["base_url"]
+
+            # Also allow cfg-level base_url override for claude
+            if provider_type == "anthropic" and self.cfg.get("base_url"):
+                base_url = self.cfg["base_url"]
+
+            try:
+                if provider_type == "anthropic":
+                    client = self._get_anthropic_client(base_url)
+                    text, tool_uses, in_tok, out_tok, has_tools = stream_anthropic(
+                        client, self.model, self.max_tokens, self.system_prompt,
+                        self.messages, lambda: self._interrupted,
+                    )
+                else:  # openai
+                    client = self._get_openai_client(base_url)
+                    text, tool_uses, in_tok, out_tok, has_tools = stream_openai(
+                        client, self.model, self.max_tokens, self.system_prompt,
+                        self.messages, lambda: self._interrupted,
+                    )
+
+            except KeyboardInterrupt:
+                self._interrupted = True
+                console.print("\n[yellow]⚡ Interrupted[/yellow]")
+                return
+            except (anthropic.APIError, openai.APIError) as e:
+                console.print(f"\n[red]API Error: {e}[/red]")
+                return
+            except Exception as e:
+                console.print(f"\n[red]Error: {e}[/red]")
+                return
+
+            # Build and save assistant message (always in canonical anthropic format)
+            assistant_msg = build_anthropic_assistant_msg(text, tool_uses)
+            if assistant_msg["content"]:
+                self.messages.append(assistant_msg)
+                self.scroll.append(assistant_msg)
+
+            # Show token usage
+            if in_tok or out_tok:
+                console.print(f"[dim]tokens: {in_tok} in / {out_tok} out[/dim]")
+
+            # If no tool calls or interrupted, done
+            if not has_tools or self._interrupted:
+                return
+
+            # Execute tools
+            results = []
+            for tu in tool_uses:
+                name = tu["name"]
+                inp = tu["input"]
+
+                display_tool_call(name, inp)
+                success, result = execute_tool(name, inp)
+
+                if len(result) > 50000:
+                    result = result[:50000] + "\n... (truncated)"
+
+                display_tool_result(name, success, result)
+
+                results.append({"id": tu["id"], "name": name, "output": result, "is_error": not success})
+
+            # Add tool results (canonical anthropic format)
+            tool_msg = build_anthropic_tool_results(results)
+            self.messages.append(tool_msg)
+            self.scroll.append(tool_msg)
+
+            # Continue loop — model will process tool results
+
+
+# ─── TUI ──────────────────────────────────────────────────────────────────────
+
+BANNER = r"""[bold magenta]
+  ╔═══════════════════════════════════════╗
+  ║         S O U L C O V E N A N T      ║
+  ╚═══════════════════════════════════════╝[/bold magenta]"""
+
+
+def print_banner(model):
+    provider = get_provider(model)
+    console.print(BANNER)
+    console.print(f"  [dim]model: {model} ({provider['type']})[/dim]")
+    console.print(f"  [dim]type /help for commands[/dim]\n")
+
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="SoulCovenant — lightweight multi-model CLI")
+    parser.add_argument("--model", "-m", help="Model to use (name or alias)")
+    parser.add_argument("--awaken", "-a", action="store_true", help="Resume the last session")
+    parser.add_argument("--scroll", "-s", help="Resume a specific scroll file")
+    args = parser.parse_args()
+
+    cfg = load_config()
+    if args.model:
+        cfg["model"] = resolve_model(args.model)
+
+    # Session setup
+    scroll = None
+    if args.scroll:
+        scroll = Scroll(args.scroll)
+        console.print(f"[cyan]Awakened scroll: {args.scroll} ({len(scroll.messages)} messages)[/cyan]")
+    elif args.awaken:
+        latest = Scroll.latest()
+        if latest:
+            scroll = Scroll(latest)
+            console.print(f"[cyan]Awakened latest scroll: {latest.name} ({len(scroll.messages)} messages)[/cyan]")
+        else:
+            console.print("[yellow]No scrolls found, starting fresh.[/yellow]")
+
+    cov = SoulCovenant(cfg, scroll)
+    print_banner(cov.model)
+
+    def sigint_handler(sig, frame):
+        cov._interrupted = True
+
+    signal.signal(signal.SIGINT, sigint_handler)
+
+    # prompt_toolkit: Enter for newline, Alt+Enter (Esc then Enter) to send
+    kb = KeyBindings()
+
+    @kb.add("escape", "enter")  # Alt+Enter → send
+    def _(event):
+        buf = event.current_buffer
+        if buf.text.strip():
+            buf.validate_and_handle()
+
+    session = PromptSession(key_bindings=kb, multiline=True)
+
+    while True:
+        try:
+            console.print()
+            user_input = session.prompt("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\n[magenta]Ascending...[/magenta]")
+            break
+
+        if not user_input:
+            continue
+
+        # Commands
+        if user_input.startswith("/"):
+            cmd = user_input.lower().split()
+            cmd_name = cmd[0]
+
+            if cmd_name in ("/ascend", "/quit", "/exit"):
+                console.print("[magenta]Ascending...[/magenta]")
+                break
+
+            elif cmd_name in ("/rebirth", "/new"):
+                cov.scroll = Scroll()
+                cov.messages = []
+                cov.system_prompt = build_system_prompt()
+                console.print("[cyan]Reborn. New scroll started.[/cyan]")
+                continue
+
+            elif cmd_name == "/model":
+                if len(cmd) > 1:
+                    cov.set_model(cmd[1])
+                else:
+                    console.print(f"[cyan]Current model: {cov.model}[/cyan]")
+                    models_catalog = cov.cfg.get("models", {})
+                    if models_catalog:
+                        console.print("[bold]Available models:[/bold]")
+                        for mid, info in models_catalog.items():
+                            p = get_provider(mid)
+                            marker = " [green]◄[/green]" if mid == cov.model else ""
+                            console.print(
+                                f"  [dim]{mid}[/dim] — {info.get('name', '?')} "
+                                f"[{p['type']}] "
+                                f"(ctx {info.get('context_window', '?')}, max {info.get('max_tokens', '?')})"
+                                f"{marker}"
+                            )
+                    if MODEL_ALIASES:
+                        console.print("[bold]Aliases:[/bold]")
+                        seen = {}
+                        for alias, mid in MODEL_ALIASES.items():
+                            seen.setdefault(mid, []).append(alias)
+                        for mid, aliases in seen.items():
+                            console.print(f"  [dim]{', '.join(aliases)}[/dim] → {mid}")
+                continue
+
+            elif cmd_name == "/scrolls":
+                scrolls = sorted(SCROLLS_DIR.glob("*.jsonl"))
+                if not scrolls:
+                    console.print("[dim]No scrolls yet.[/dim]")
+                else:
+                    for s in scrolls[-10:]:
+                        count = sum(1 for _ in open(s))
+                        console.print(f"  [dim]{s.name}[/dim] ({count} messages)")
+                continue
+
+            elif cmd_name == "/soul":
+                soul_files = sorted(SOUL_DIR.glob("*.md"))
+                if not soul_files:
+                    console.print("[dim]No soul memories yet.[/dim]")
+                else:
+                    for sf in soul_files:
+                        size = sf.stat().st_size
+                        console.print(f"  [dim]{sf.name}[/dim] ({size} bytes)")
+                continue
+
+            elif cmd_name == "/sync":
+                if sync_models():
+                    # Reload config to pick up new models
+                    cov.cfg = load_config()
+                continue
+
+            elif cmd_name == "/help":
+                console.print("[bold]Commands:[/bold]")
+                console.print("  /rebirth, /new   — Start a new session")
+                console.print("  /ascend, /quit   — Exit")
+                console.print("  /model [name]    — Show or switch model")
+                console.print("  /sync            — Sync models from aicodewith")
+                console.print("  /scrolls         — List saved sessions")
+                console.print("  /soul            — List soul memories")
+                console.print("  /help            — Show this help")
+                console.print()
+                console.print("[bold]Multi-line input:[/bold]")
+                console.print("  Enter for newline, Alt+Enter (or Esc then Enter) to send")
+                console.print()
+                console.print("[bold]Model aliases:[/bold]")
+                console.print("  opus, sonnet, haiku — Claude models")
+                console.print("  codex, gpt5.2       — GPT models")
+                console.print("  gemini              — Gemini models")
+                continue
+
+            else:
+                console.print(f"[yellow]Unknown command: {cmd_name}[/yellow]")
+                continue
+
+        # Normal message
+        user_msg = {"role": "user", "content": user_input}
+        cov.messages.append(user_msg)
+        cov.scroll.append(user_msg)
+
+        console.print()
+        cov.stream_response()
+
+
+if __name__ == "__main__":
+    main()
